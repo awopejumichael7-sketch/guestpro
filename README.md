@@ -69,3 +69,10 @@ If PowerShell blocks `npm.ps1`, use `npm.cmd` as shown above. If npm reports tha
 ## Deployment
 
 See `DEPLOYMENT.md` for the static frontend deployment notes. GitHub Pages can host the frontend only; it cannot run this API or safely hold OAuth credentials. A real cloud-connected deployment needs a separately hosted backend and a production database.
+
+
+## Frontend/API integration status (v0.4 development)
+
+The React frontend now includes registration and login screens and uses the API for authenticated workspace loading, guest create/update/delete, seat generation/assignment, check-in/check-out, and event settings. Set `VITE_API_BASE_URL` to the absolute origin of the separately hosted API before building the frontend. For local development, leave it unset or set it to `http://localhost:8787` and run the API on that port.
+
+The API must be deployed separately from GitHub Pages. Configure `CORS_ORIGINS` to include the exact published frontend origin, for example `https://YOUR-ACCOUNT.github.io`. Keep `JWT_SECRET` private and use a production database before real customer data. The JSON file store is development-only and is not suitable for multi-instance production hosting. Existing browser-local records are not automatically migrated into an account; export the CSV first and import it after signing in.
