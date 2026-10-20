@@ -1,0 +1,13 @@
+{
+  "name": "GuestPass Pro",
+  "short_name": "GuestPass",
+  "description": "Guest invitation and seating management",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#101a35",
+  "icons": [
+    { "src": "./guestpass-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
