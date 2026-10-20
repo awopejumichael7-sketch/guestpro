@@ -22,10 +22,21 @@ type Guest = {
   notes: string;
   createdAt: string;
 };
-type Seat = { id: string; section: string; row: string; number: number; status: 'available' | 'blocked' };
+type Seat = { id: string; section: string; row: string; number: number; status: 'available' | 'blocked'; label?: string };
 type EventData = { name: string; date: string; venue: string; capacity: number; section: string };
 
 const STORAGE_KEY = 'guestpass-pro-demo-v1';
+const TOKEN_KEY = 'guestpass-pro-session-token';
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
+type ApiUser = { id: string; name: string; email: string; role: string };
+type ApiOrganization = { id: string; name: string };
+async function apiRequest<T>(path: string, token: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${API_BASE}/api${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...(options.headers || {}) } });
+  if (response.status === 204) return undefined as T;
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Request failed (${response.status}).`);
+  return body as T;
+}
 const defaultEvent: EventData = {
   name: 'Annual Convention 2026',
   date: '',
@@ -64,18 +75,68 @@ export default function App() {
   const [editing, setEditing] = useState<Guest | null>(null);
   const [notice, setNotice] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '');
+  const [eventId, setEventId] = useState('');
+  const [account, setAccount] = useState<{ user: ApiUser; organization: ApiOrganization } | null>(null);
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authName, setAuthName] = useState('');
+  const [authOrg, setAuthOrg] = useState('');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [apiReady, setApiReady] = useState(false);
   const [form, setForm] = useState({
     name: '', title: '', organization: '', category: 'VIP', phone: '', email: '',
     photo: '', seatId: '', notes: ''
   });
 
   useEffect(() => {
+    if (token) return; // Authenticated workspaces are persisted by the API, not browser storage.
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({ guests, seats, event }));
     } catch {
       setNotice('Storage is full. Export your guest list and use smaller photos before adding more records.');
     }
   }, [guests, seats, event]);
+
+  async function loadWorkspace(sessionToken: string) {
+    const listing = await apiRequest<{ events: Array<EventData & { id: string }> }>('/events', sessionToken);
+    let selected = listing.events[0];
+    if (!selected) {
+      const created = await apiRequest<{ event: EventData & { id: string } }>('/events', sessionToken, { method: 'POST', body: JSON.stringify(defaultEvent) });
+      selected = created.event;
+    }
+    const details = await apiRequest<{ event: EventData & { id: string }; guests: Guest[]; seats: Seat[] }>(`/events/${selected.id}`, sessionToken);
+    setEventId(details.event.id);
+    setEvent({ name: details.event.name, date: details.event.date || '', venue: details.event.venue || '', capacity: details.event.capacity || 100, section: details.event.section || 'Main Hall' });
+    setGuests(details.guests);
+    setSeats(details.seats.map(seat => ({ ...seat, label: seat.label || `${seat.section} · ${seat.row}${seat.number}` })));
+    const me = await apiRequest<{ user: ApiUser; organization: ApiOrganization }>('/auth/me', sessionToken);
+    setAccount(me);
+    setApiReady(true);
+  }
+
+  async function submitAuth(e: FormEvent) {
+    e.preventDefault(); setAuthBusy(true);
+    try {
+      const payload = authMode === 'register'
+        ? { organizationName: authOrg, name: authName, email: authEmail, password: authPassword }
+        : { email: authEmail, password: authPassword };
+      const result = await apiRequest<{ token: string; user: ApiUser; organization: ApiOrganization }>(`/auth/${authMode === 'register' ? 'register' : 'login'}`, '', { method: 'POST', body: JSON.stringify(payload) });
+      localStorage.setItem(TOKEN_KEY, result.token); setToken(result.token); setNotice('Signed in. Loading your workspace…');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Unable to sign in. Check the API configuration.'); }
+    finally { setAuthBusy(false); }
+  }
+
+  function signOut() {
+    localStorage.removeItem(TOKEN_KEY); setToken(''); setEventId(''); setAccount(null); setApiReady(false);
+    setGuests([]); setSeats([]); setEvent(defaultEvent); setNotice('Signed out.');
+  }
+
+  useEffect(() => {
+    if (!token || apiReady) return;
+    loadWorkspace(token).catch(error => { localStorage.removeItem(TOKEN_KEY); setToken(''); setNotice(error instanceof Error ? error.message : 'Session expired. Please sign in again.'); });
+  }, [token, apiReady]);
 
   useEffect(() => {
     if (!notice) return;
@@ -124,68 +185,63 @@ export default function App() {
     reader.onload = () => setForm(prev => ({ ...prev, photo: String(reader.result ?? '') }));
     reader.readAsDataURL(file);
   }
-  function saveGuest(e: FormEvent) {
+  async function saveGuest(e: FormEvent) {
     e.preventDefault();
-    if (!form.name.trim()) {
-      setNotice('Guest full name is required.');
-      return;
-    }
-    if (form.seatId && guests.some(g => g.id !== editing?.id && g.seatId === form.seatId)) {
-      setNotice('That seat is already assigned to another guest.');
-      return;
-    }
-    const guest: Guest = {
-      id: editing?.id ?? makeId(),
-      name: form.name.trim(),
-      title: form.title.trim(),
-      organization: form.organization.trim(),
-      category: form.category,
-      phone: form.phone.trim(),
-      email: form.email.trim(),
-      photo: form.photo,
-      seatId: form.seatId,
-      invitationCode: editing?.invitationCode ?? makeCode(),
-      checkedInAt: editing?.checkedInAt ?? '',
-      notes: form.notes.trim(),
-      createdAt: editing?.createdAt ?? new Date().toISOString()
-    };
-    setGuests(prev => editing ? prev.map(g => g.id === editing.id ? guest : g) : [guest, ...prev]);
-    setModalOpen(false);
-    setNotice(editing ? 'Guest details updated.' : 'Guest added successfully.');
+    if (!form.name.trim()) { setNotice('Guest full name is required.'); return; }
+    if (form.seatId && guests.some(g => g.id !== editing?.id && g.seatId === form.seatId)) { setNotice('That seat is already assigned to another guest.'); return; }
+    const payload = { name: form.name.trim(), title: form.title.trim(), organization: form.organization.trim(), category: form.category, phone: form.phone.trim(), email: form.email.trim(), photo: form.photo, seatId: form.seatId, notes: form.notes.trim() };
+    try {
+      if (token && eventId) {
+        const result = await apiRequest<{ guest: Guest }>(`/events/${eventId}/guests${editing ? `/${editing.id}` : ''}`, token, { method: editing ? 'PATCH' : 'POST', body: JSON.stringify(payload) });
+        setGuests(prev => editing ? prev.map(g => g.id === editing.id ? result.guest : g) : [result.guest, ...prev]);
+      } else {
+        const guest: Guest = { id: editing?.id ?? makeId(), ...payload, invitationCode: editing?.invitationCode ?? makeCode(), checkedInAt: editing?.checkedInAt ?? '', createdAt: editing?.createdAt ?? new Date().toISOString() };
+        setGuests(prev => editing ? prev.map(g => g.id === editing.id ? guest : g) : [guest, ...prev]);
+      }
+      setModalOpen(false); setNotice(editing ? 'Guest details updated.' : 'Guest added successfully.');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not save guest.'); }
   }
-  function deleteGuest(guest: Guest) {
-    if (!window.confirm(`Delete ${guest.name}? This cannot be undone in this browser.`)) return;
-    setGuests(prev => prev.filter(g => g.id !== guest.id));
-    setNotice('Guest deleted.');
+  async function deleteGuest(guest: Guest) {
+    if (!window.confirm(`Delete ${guest.name}? This cannot be undone.`)) return;
+    try {
+      if (token && eventId) await apiRequest<void>(`/events/${eventId}/guests/${guest.id}`, token, { method: 'DELETE' });
+      setGuests(prev => prev.filter(g => g.id !== guest.id)); setNotice('Guest deleted.');
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not delete guest.'); }
   }
-  function toggleCheckIn(guest: Guest) {
-    setGuests(prev => prev.map(g => g.id === guest.id ? { ...g, checkedInAt: g.checkedInAt ? '' : new Date().toISOString() } : g));
-    setNotice(guest.checkedInAt ? 'Check-in reversed.' : `${guest.name} checked in.`);
+  async function toggleCheckIn(guest: Guest) {
+    try {
+      if (token && eventId) {
+        if (guest.checkedInAt) await apiRequest<{ guest: Guest }>(`/events/${eventId}/guests/${guest.id}/check-out`, token, { method: 'POST' });
+        else await apiRequest<{ guest: Guest }>(`/events/${eventId}/check-in`, token, { method: 'POST', body: JSON.stringify({ invitationCode: guest.invitationCode }) });
+      }
+      setGuests(prev => prev.map(g => g.id === guest.id ? { ...g, checkedInAt: g.checkedInAt ? '' : new Date().toISOString() } : g));
+      setNotice(guest.checkedInAt ? 'Check-in reversed.' : `${guest.name} checked in.`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not update attendance.'); }
   }
-  function generateSeats() {
+  async function generateSeats() {
     const count = Math.max(1, Math.min(5000, Math.floor(Number(event.capacity) || 1)));
     const section = event.section.trim() || 'Main Hall';
-    const next: Seat[] = Array.from({ length: count }, (_, i) => {
-      const rowIndex = Math.floor(i / 10);
-      const row = String.fromCharCode(65 + (rowIndex % 26)) + (rowIndex >= 26 ? Math.floor(rowIndex / 26) : '');
-      return { id: `${section}-${row}${String((i % 10) + 1).padStart(2, '0')}`, section, row, number: (i % 10) + 1, status: 'available' };
-    });
-    const occupied = new Set(guests.map(g => g.seatId).filter(Boolean));
-    const retained = next.filter(s => occupied.has(s.id));
-    if (retained.length < occupied.size) {
-      const missing = guests.filter(g => g.seatId && !next.some(s => s.id === g.seatId));
-      if (missing.length && !window.confirm('Some assigned seats are outside this new layout. Continue and clear those assignments?')) return;
-      setGuests(prev => prev.map(g => next.some(s => s.id === g.seatId) ? g : { ...g, seatId: '' }));
-    }
-    setSeats(next);
-    setNotice(`${count} seats generated. Existing assignments were retained where possible.`);
-  }
-  function assignSeat(guestId: string, seatId: string) {
-    if (seatId && guests.some(g => g.id !== guestId && g.seatId === seatId)) {
-      setNotice('That seat is already assigned.');
+    if (token && eventId) {
+      try {
+        const result = await apiRequest<{ seats: Seat[] }>(`/events/${eventId}/seats/generate`, token, { method: 'POST', body: JSON.stringify({ count, section, columns: 10 }) });
+        setSeats(prev => [...prev, ...result.seats.map(seat => ({ ...seat, label: seat.label || `${seat.section} · ${seat.row}${seat.number}` }))]);
+        setNotice(`${result.seats.length} seats generated and saved to your account.`);
+      } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not generate seats.'); }
       return;
     }
-    setGuests(prev => prev.map(g => g.id === guestId ? { ...g, seatId } : g));
+    const next: Seat[] = Array.from({ length: count }, (_, i) => { const rowIndex = Math.floor(i / 10); const row = String.fromCharCode(65 + (rowIndex % 26)) + (rowIndex >= 26 ? Math.floor(rowIndex / 26) : ''); return { id: `${section}-${row}${String((i % 10) + 1).padStart(2, '0')}`, section, row, number: (i % 10) + 1, status: 'available' }; });
+    const occupied = new Set(guests.map(g => g.seatId).filter(Boolean));
+    if (guests.some(g => g.seatId && !next.some(seat => seat.id === g.seatId)) && !window.confirm('Some assigned seats are outside this new layout. Continue and clear those assignments?')) return;
+    setGuests(prev => prev.map(g => next.some(seat => seat.id === g.seatId) ? g : { ...g, seatId: '' })); setSeats(next); setNotice(`${count} seats generated.`);
+  }
+  async function assignSeat(guestId: string, seatId: string) {
+    if (seatId && guests.some(g => g.id !== guestId && g.seatId === seatId)) { setNotice('That seat is already assigned.'); return; }
+    try {
+      if (token && eventId) {
+        const result = await apiRequest<{ guest: Guest }>(`/events/${eventId}/guests/${guestId}`, token, { method: 'PATCH', body: JSON.stringify({ seatId }) });
+        setGuests(prev => prev.map(g => g.id === guestId ? result.guest : g));
+      } else setGuests(prev => prev.map(g => g.id === guestId ? { ...g, seatId } : g));
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not assign seat.'); }
   }
   function exportCsv() {
     const headers = ['Name', 'Title', 'Organization', 'Category', 'Phone', 'Email', 'Seat', 'Invitation Code', 'Attendance', 'Check-in Time', 'Notes'];
@@ -204,7 +260,7 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => {
+    reader.onload = async () => {
       const lines = String(reader.result ?? '').split(/\r?\n/).filter(Boolean);
       if (lines.length < 2) { setNotice('The CSV has no guest rows.'); return; }
       const parse = (line: string) => {
@@ -231,8 +287,14 @@ export default function App() {
         category: col(r, 'category', 3) || 'General', phone: col(r, 'phone', 4), email: col(r, 'email', 5), photo: '',
         seatId: '', invitationCode: makeCode(), checkedInAt: '', notes: col(r, 'notes', 6), createdAt: new Date().toISOString()
       }));
-      setGuests(prev => [...added, ...prev]);
-      setNotice(`${added.length} guest(s) imported. Guest details imported from matching CSV columns; photos, seats, and check-in status are not imported.`);
+      try {
+        if (token && eventId) {
+          const created: Guest[] = [];
+          for (const guest of added) { const result = await apiRequest<{ guest: Guest }>(`/events/${eventId}/guests`, token, { method: 'POST', body: JSON.stringify({ name: guest.name, title: guest.title, organization: guest.organization, category: guest.category, phone: guest.phone, email: guest.email, notes: guest.notes }) }); created.push(result.guest); }
+          setGuests(prev => [...created, ...prev]);
+        } else setGuests(prev => [...added, ...prev]);
+        setNotice(`${added.length} guest(s) imported. Photos, seats, and check-in status are not imported.`);
+      } catch (error) { setNotice(error instanceof Error ? `Import stopped: ${error.message}` : 'Import failed.'); }
       e.target.value = '';
     };
     reader.readAsText(file);
@@ -246,6 +308,9 @@ export default function App() {
     { id: 'invitations', label: 'QR invitations', icon: QrCode },
     { id: 'settings', label: 'Event settings', icon: Settings2 }
   ] as const;
+
+  if (token && !apiReady) return <div className="auth-shell"><section className="auth-card"><div className="brand-mark">GP</div><h1>Opening your workspace</h1><p>Loading your events, guests, and seating from the API…</p></section></div>;
+  if (!token) return <div className="auth-shell"><section className="auth-card"><div className="brand-mark">GP</div><p className="eyebrow">GUEST MANAGEMENT PLATFORM</p><h1>{authMode === 'register' ? 'Create your workspace' : 'Welcome back'}</h1><p>Sign in to save your events and guest records to the GuestPass Pro API.</p><form onSubmit={submitAuth} className="auth-form">{authMode === 'register' && <><label>Your name<input required minLength={2} value={authName} onChange={e => setAuthName(e.target.value)} /></label><label>Organization name<input required minLength={2} value={authOrg} onChange={e => setAuthOrg(e.target.value)} placeholder="Church or event organization" /></label></>}<label>Email address<input type="email" required value={authEmail} onChange={e => setAuthEmail(e.target.value)} autoComplete="email" /></label><label>Password<input type="password" required minLength={authMode === 'register' ? 12 : 1} value={authPassword} onChange={e => setAuthPassword(e.target.value)} autoComplete={authMode === 'register' ? 'new-password' : 'current-password'} />{authMode === 'register' && <small>Use at least 12 characters.</small>}</label><button className="button primary auth-submit" disabled={authBusy}>{authBusy ? 'Please wait…' : authMode === 'register' ? 'Create account' : 'Sign in'}</button></form><button className="auth-switch" onClick={() => setAuthMode(authMode === 'login' ? 'register' : 'login')}>{authMode === 'login' ? 'New to GuestPass Pro? Create an account' : 'Already registered? Sign in'}</button><p className="auth-footnote">Your browser must be able to reach the configured API server. Do not use real guest information until production hosting and storage are secured.</p>{notice && <p role="alert" className="auth-error">{notice}</p>}</section></div>;
 
   return (
     <div className="app-shell">
@@ -319,9 +384,9 @@ export default function App() {
             <section className="panel directory-panel">
               <div className="directory-toolbar"><div className="search-box"><Search size={17}/><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search name, code, organization or seat..." /></div><select value={filter} onChange={e => setFilter(e.target.value)} className="filter-select"><option>All guests</option><option>VIP</option><option>Arrived</option><option>Not arrived</option></select><label className="button secondary upload-button"><Upload size={16}/> Import CSV<input type="file" accept=".csv,text/csv" onChange={importCsv} hidden /></label><button className="button secondary" onClick={exportCsv}><Download size={16}/> Export</button></div>
               <div className="table-wrap"><table><thead><tr><th>GUEST</th><th>CATEGORY</th><th>INVITATION CODE</th><th>ASSIGNED SEAT</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody>
-                {visibleGuests.map(g => <tr key={g.id}><td><div className="table-guest"><Avatar guest={g}/><span><b>{g.name}</b><small>{g.title || g.organization || 'Invited guest'}</small></span></div></td><td><span className={`category-tag ${g.category.toLowerCase().replaceAll(' ', '-')}`}>{g.category}</span></td><td><code>{g.invitationCode}</code></td><td>{g.seatId || <span className="muted">Not assigned</span>}</td><td><span className={`status-tag ${g.checkedInAt ? 'arrived' : 'pending'}`}><span></span>{g.checkedInAt ? 'Arrived' : 'Expected'}</span></td><td><div className="action-buttons"><button className="icon-button" title="Edit guest" onClick={() => openEditGuest(g)}><Pencil size={16}/></button><button className="icon-button danger-hover" title="Delete guest" onClick={() => deleteGuest(g)}><Trash2 size={16}/></button></div></td></tr>)}
+                {visibleGuests.map(g => <tr key={g.id}><td><div className="table-guest"><Avatar guest={g}/><span><b>{g.name}</b><small>{g.title || g.organization || 'Invited guest'}</small></span></div></td><td><span className={`category-tag ${g.category.toLowerCase().replaceAll(' ', '-')}`}>{g.category}</span></td><td><code>{g.invitationCode}</code></td><td>{g.seatId ? (seats.find(seat => seat.id === g.seatId)?.label || g.seatId) : <span className="muted">Not assigned</span>}</td><td><span className={`status-tag ${g.checkedInAt ? 'arrived' : 'pending'}`}><span></span>{g.checkedInAt ? 'Arrived' : 'Expected'}</span></td><td><div className="action-buttons"><button className="icon-button" title="Edit guest" onClick={() => openEditGuest(g)}><Pencil size={16}/></button><button className="icon-button danger-hover" title="Delete guest" onClick={() => deleteGuest(g)}><Trash2 size={16}/></button></div></td></tr>)}
                 {visibleGuests.length === 0 && <tr><td colSpan={6}><EmptyState title="No guests found" text={guests.length ? 'Try another search or filter.' : 'Register a guest or import a CSV file to get started.'} action={!guests.length ? 'Add guest' : undefined} onAction={openNewGuest}/></td></tr>}
-              </tbody></table></div><div className="table-footer"><span>Showing <b>{visibleGuests.length}</b> of <b>{guests.length}</b> guests</span><span>Local prototype · CSV export available</span></div>
+              </tbody></table></div><div className="table-footer"><span>Showing <b>{visibleGuests.length}</b> of <b>{guests.length}</b> guests</span><span>{token ? 'Cloud API workspace · CSV export available' : 'Local prototype · CSV export available'}</span></div>
             </section>
           </>}
 
@@ -332,9 +397,9 @@ export default function App() {
             {seats.length === 0 ? <section className="panel empty-seating"><Armchair size={34}/><h3>No seating layout yet</h3><p>Choose 50, 100, or a custom capacity above to generate your first seating plan.</p></section> :
               <section className="panel seating-panel"><div className="stage-label">STAGE / FRONT OF VENUE</div><div className="seat-grid">{seats.map(s => {
                 const guest = guests.find(g => g.seatId === s.id);
-                return <button key={s.id} className={`seat ${guest ? 'seat-occupied' : 'seat-free'}`} title={guest ? `${s.id}: ${guest.name}` : `${s.id}: Available`} onClick={() => {
+                return <button key={s.id} className={`seat ${guest ? 'seat-occupied' : 'seat-free'}`} title={guest ? `${s.label || s.id}: ${guest.name}` : `${s.label || s.id}: Available`} onClick={() => {
                   if (guest) { setPage('guests'); setSearch(guest.name); }
-                  else { setPage('guests'); setNotice(`Choose an unassigned guest and select seat ${s.id} in their edit form.`); }
+                  else { setPage('guests'); setNotice(`Choose an unassigned guest and select seat ${s.label || s.id} in their edit form.`); }
                 }}><span>{s.row}{String(s.number).padStart(2,'0')}</span>{guest && <small>{guest.name.split(' ')[0]}</small>}</button>;
               })}</div><div className="seating-footnote">Select an occupied seat to find its guest. To assign or move a guest, edit their profile in Guest directory.</div></section>}
           </>}
@@ -349,7 +414,7 @@ export default function App() {
                   <div className="invitation-brand"><div className="brand-mark">GP</div><div><b>GuestPass <span>Pro</span></b><small>OFFICIAL GUEST INVITATION</small></div></div>
                   <div className="invitation-event"><span>YOU ARE INVITED TO</span><h2>{event.name || 'Event invitation'}</h2><p>{[event.date, event.venue].filter(Boolean).join(' · ') || 'Event details to be confirmed'}</p></div>
                   <div className="invitation-main"><Avatar guest={g} large/><div className="invitation-guest"><h3>{g.name}</h3><p>{[g.title, g.organization].filter(Boolean).join(' · ') || 'Invited guest'}</p><span className="category-tag">{g.category}</span></div><div className="invitation-qr"><QRCodeSVG value={checkinUrl} size={112} level="M" includeMargin/><small>SCAN TO VERIFY</small></div></div>
-                  <div className="invitation-details"><div><small>INVITATION CODE</small><b>{g.invitationCode}</b></div><div><small>ASSIGNED SEAT</small><b>{g.seatId || 'Not assigned'}</b></div></div>
+                  <div className="invitation-details"><div><small>INVITATION CODE</small><b>{g.invitationCode}</b></div><div><small>ASSIGNED SEAT</small><b>{g.seatId ? (seats.find(seat => seat.id === g.seatId)?.label || g.seatId) : 'Not assigned'}</b></div></div>
                   <div className="invitation-footer"><span>Present this pass at the entrance.</span><span>GuestPass Pro</span></div>
                 </article>;
               })}</div>}
@@ -365,8 +430,8 @@ export default function App() {
 
           {page === 'settings' && <>
             <div className="page-heading"><div><div className="eyebrow">CONFIGURATION</div><h1>Event settings</h1><p>Configure the event details shown on your workspace.</p></div></div>
-            <section className="panel settings-panel"><div className="panel-heading"><div><h3>Event information</h3><p>These details are stored in this browser in the prototype.</p></div></div><form className="settings-form" onSubmit={e => {e.preventDefault(); setNotice('Event settings saved.');}}><label>Event name<input required value={event.name} onChange={e => setEvent({...event,name:e.target.value})} placeholder="e.g. Annual Convention"/></label><div className="form-two"><label>Event date<input type="date" value={event.date} onChange={e => setEvent({...event,date:e.target.value})}/></label><label>Venue<input value={event.venue} onChange={e => setEvent({...event,venue:e.target.value})} placeholder="Venue name"/></label></div><div className="form-two"><label>Default seating section<input value={event.section} onChange={e => setEvent({...event,section:e.target.value})}/></label><label>Planned seat capacity<input type="number" min="1" max="5000" value={event.capacity} onChange={e => setEvent({...event,capacity:Number(e.target.value)})}/></label></div><button className="button primary" type="submit">Save event details</button></form></section>
-            <section className="panel data-panel"><div className="panel-heading"><div><h3>Local data management</h3><p>Export a copy before clearing this browser's stored data.</p></div></div><div className="data-actions"><button className="button secondary" onClick={exportCsv}><Download size={16}/> Export guest CSV</button><button className="button danger" onClick={() => {if(window.confirm('Delete all guests and seats from this browser? Export first if you need a copy.')) {setGuests([]);setSeats([]);setNotice('Guest and seating records cleared.');}}}><Trash2 size={16}/> Clear guest and seating data</button></div><p className="small-print">This prototype does not yet have user authentication, cloud backup, Google Drive sync, or organization-level access controls. Do not store real guests' private data in it.</p></section>
+            <section className="panel settings-panel"><div className="panel-heading"><div><h3>Event information</h3><p>These details are saved to your workspace when you are signed in.</p></div></div><form className="settings-form" onSubmit={async e => {e.preventDefault(); try { if (token && eventId) await apiRequest(`/events/${eventId}`, token, { method: 'PATCH', body: JSON.stringify(event) }); setNotice('Event settings saved.'); } catch (error) { setNotice(error instanceof Error ? error.message : 'Could not save settings.'); } }}><label>Event name<input required value={event.name} onChange={e => setEvent({...event,name:e.target.value})} placeholder="e.g. Annual Convention"/></label><div className="form-two"><label>Event date<input type="date" value={event.date} onChange={e => setEvent({...event,date:e.target.value})}/></label><label>Venue<input value={event.venue} onChange={e => setEvent({...event,venue:e.target.value})} placeholder="Venue name"/></label></div><div className="form-two"><label>Default seating section<input value={event.section} onChange={e => setEvent({...event,section:e.target.value})}/></label><label>Planned seat capacity<input type="number" min="1" max="5000" value={event.capacity} onChange={e => setEvent({...event,capacity:Number(e.target.value)})}/></label></div><button className="button primary" type="submit">Save event details</button></form></section>
+            <section className="panel data-panel"><div className="panel-heading"><div><h3>Local data management</h3><p>Export a copy before clearing this browser's stored data.</p></div></div><div className="data-actions"><button className="button secondary" onClick={exportCsv}><Download size={16}/> Export guest CSV</button><button className="button danger" onClick={() => {if(window.confirm('Delete all guests and seats from this browser? Export first if you need a copy.')) {setGuests([]);setSeats([]);setNotice('Guest and seating records cleared.');}}}><Trash2 size={16}/> Clear guest and seating data</button></div><p className="small-print">Cloud API storage is enabled for this signed-in workspace. Production database hardening, Google Drive/Sheets sync, and staff roles are still pending.</p></section>
           </>}
         </div>
       </main>
@@ -376,7 +441,7 @@ export default function App() {
           <div className="form-two"><label>Full name <span>*</span><input required value={form.name} onChange={e => setForm({...form,name:e.target.value})} placeholder="Guest's full name"/></label><label>Title / designation<input value={form.title} onChange={e => setForm({...form,title:e.target.value})} placeholder="e.g. Reverend, Dr."/></label></div>
           <div className="form-two"><label>Organization<input value={form.organization} onChange={e => setForm({...form,organization:e.target.value})} placeholder="Church or organization"/></label><label>Invitation category<select value={form.category} onChange={e => setForm({...form,category:e.target.value})}><option>VIP</option><option>Guest Minister</option><option>Church Leader</option><option>Sponsor</option><option>Government Official</option><option>Media</option><option>General</option></select></label></div>
           <div className="form-two"><label>Phone (optional)<input value={form.phone} onChange={e => setForm({...form,phone:e.target.value})} placeholder="Phone number"/></label><label>Email (optional)<input type="email" value={form.email} onChange={e => setForm({...form,email:e.target.value})} placeholder="Email address"/></label></div>
-          <label>Assigned seat<select value={form.seatId} onChange={e => setForm({...form,seatId:e.target.value})}><option value="">Not assigned</option>{seats.filter(s => !guests.some(g => g.id !== editing?.id && g.seatId === s.id)).map(s => <option key={s.id} value={s.id}>{s.id}</option>)}</select></label>
+          <label>Assigned seat<select value={form.seatId} onChange={e => setForm({...form,seatId:e.target.value})}><option value="">Not assigned</option>{seats.filter(s => !guests.some(g => g.id !== editing?.id && g.seatId === s.id)).map(s => <option key={s.id} value={s.id}>{s.label || s.id}</option>)}</select></label>
           <label>Notes (optional)<textarea value={form.notes} onChange={e => setForm({...form,notes:e.target.value})} rows={2} placeholder="Additional information for authorized staff"/></label>
           <div className="modal-actions"><button type="button" className="button secondary" onClick={() => setModalOpen(false)}>Cancel</button><button type="submit" className="button primary">{editing ? 'Save changes' : 'Register guest'}</button></div>
         </form>
